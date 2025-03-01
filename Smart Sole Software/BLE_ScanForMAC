@@ -1,0 +1,21 @@
+import asyncio
+from bleak import BleakScanner
+
+def display_devices(devices):
+    print("\nFound Devices:")
+    print("-----------------------------")
+    for device in devices:
+        name = device.name or "Unknown"
+        address = device.address
+        print(f"Name: {name}, MAC Address: {address}")
+
+async def scan_ble_devices():
+    print("Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    display_devices(devices)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(scan_ble_devices())
+    except Exception as e:
+        print(f"Error occurred: {e}")

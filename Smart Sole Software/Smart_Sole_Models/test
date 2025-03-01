@@ -1,0 +1,259 @@
+import asyncio as asy
+from bleak import BleakClient
+from multiprocessing import Queue
+import numpy as np
+import tensorflow as tf
+from sklearn.ensemble import IsolationForest
+import pandas as pd
+import tkinter as tk
+from tkinter import ttk, messagebox
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.animation as animation
+from datetime import datetime
+import json
+from sklearn.preprocessing import StandardScaler
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class SmartSoleMonitor:
+    def __init__(self):
+        self.MAC_ADDRESS = "24:EC:4A:00:04:89"
+        self.SERVICE_UUID = "d90562d9-6939-4431-b382-48e783366d67"
+        self.CHARACTERISTIC_UUID = "0a002f5b-d64e-4667-9cc3-c0c5c857715a"
+        self.LABELS = {
+            'Standing': 0,
+            'Sitting': 1,
+            'Walking': 2,
+            'limping': 3,
+            'heel_avoidance_stationary': 4,
+            'heel_avoidance_dynamic': 5,
+            'LateralArch_avoidance_stationary': 6,
+            'LateralArch_avoidance_dynamic': 7,
+        }
+        self.REVERSE_LABELS = {v: k for k, v in self.LABELS.items()}
+        self.data_queue = Queue()
+        self.matrix_buffer = np.array([])
+        self.recording = False
+        self.recorded_data = []
+        self.behavior_model = None
+        self.root = tk.Tk()
+        self.setup_gui()
+        self.time_data = []
+        self.heel_data = []
+        self.lat_arch_data = []
+        self.med_meta_data = []
+        self.setup_plots()
+        self.load_model()
+
+    def load_model(self):
+        try:
+            model_path = "C:/Users/basil/Documents/PROJECTS/SMART__SOLE/Smart Sole Software/Smart_Sole_Models/Behavioural_classification_model.keras"
+            self.behavior_model = tf.keras.models.load_model(model_path)
+            self.behavior_model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                loss='sparse_categorical_crossentropy',
+                metrics=['accuracy']
+            )
+            logging.info("Model loaded successfully.")
+        except Exception as e:
+            logging.error(f"Failed to load model: {e}")
+            messagebox.showerror("Error", f"Failed to load model: {e}")
+            raise
+
+    def setup_gui(self):
+        self.root.title("Smart Sole Monitor")
+        self.root.geometry("1200x800")
+        self.create_status_frame()
+        self.create_graph_frame()
+        self.create_control_frame()
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+
+    def create_status_frame(self):
+        status_frame = ttk.LabelFrame(self.root, text="Status", padding="10")
+        status_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
+
+    def create_graph_frame(self):
+        self.graph_frame = ttk.LabelFrame(self.root, text="Sensor Data", padding="10")
+        self.graph_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+
+    def create_control_frame(self):
+        control_frame = ttk.LabelFrame(self.root, text="Controls", padding="10")
+        control_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+        
+
+    def setup_plots(self):
+        self.fig = Figure(figsize=(12, 6))
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Real-time Pressure Data")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Pressure (kPa)")
+        
+        # Create line objects
+        self.heel_line, = self.ax.plot([], [], label='Heel')
+        self.lat_arch_line, = self.ax.plot([], [], label='Lateral Arch')
+        self.med_meta_line, = self.ax.plot([], [], label='Medial Metatarsal')
+        
+        self.ax.legend()
+        
+        # Create canvas
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    async def start_ble(self):
+        try:
+            async with BleakClient(self.MAC_ADDRESS) as client:
+                self.connection_var.set("Connected")
+                self.connection_label.configure(foreground="green")
+                await client.start_notify(
+                    self.CHARACTERISTIC_UUID,
+                    self.handle_ble_data
+                )
+                await asy.Event().wait()
+        except Exception as e:
+            self.connection_var.set("Disconnected")
+            self.connection_label.configure(foreground="red")
+            logging.error(f"BLE connection error: {e}")
+            messagebox.showerror("Connection Error", str(e))
+
+    async def handle_ble_data(self, sender, data):
+        try:
+            decoded_data = data.decode("utf-8")
+            heel, lat_arch, medial = map(int, decoded_data.split(",")[1:])
+            self.heel_data.append(heel)
+            self.lat_arch_data.append(lat_arch)
+            self.med_meta_data.append(medial)
+            self.time_data.append(datetime.now())
+            if len(self.time_data) > 100:
+                self.time_data = self.time_data[-100:]
+                self.heel_data = self.heel_data[-100:]
+                self.lat_arch_data = self.lat_arch_data[-100:]
+                self.med_meta_data = self.med_meta_data[-100:]
+            if len(self.matrix_buffer) < 60:
+                self.matrix_buffer = np.append(self.matrix_buffer, np.array([heel, lat_arch, medial]))
+            if len(self.matrix_buffer) == 60:
+                processed_data = self.preprocess_data(self.matrix_buffer)
+                if processed_data is not None:
+                    behavior, behavior_index = self.predict_behavior(processed_data)
+                    is_anomaly, score = self.detect_anomaly(behavior_index, processed_data)
+                    self.behavior_var.set(self.REVERSE_LABELS[behavior])
+                    self.anomaly_var.set(f"Anomaly Detected (Score: {score:.2f})" if is_anomaly else f"Normal (Score: {score:.2f})")
+                    if self.recording:
+                        self.recorded_data.append({
+                            'timestamp': datetime.now().isoformat(),
+                            'heel': heel,
+                            'lateral_arch': lat_arch,
+                            'medial_metatarsal': medial,
+                            'behavior': behavior,
+                            'is_anomaly': is_anomaly,
+                            'anomaly_score': score
+                        })
+                    self.matrix_buffer = np.array([])
+        except Exception as e:
+            logging.error(f"Error processing BLE data: {e}")
+
+    def preprocess_data(self, data):
+        if len(data) == 60:
+            scalar = StandardScaler()
+            try:
+                return scalar.fit_transform(data)
+            except Exception as e:
+                logging.error(f"Error preprocessing data: {e}")
+                return None
+        return None
+
+    def predict_behavior(self, data):
+        if data is None:
+            return "Unknown", None
+        try:
+            predictions = self.behavior_model.predict(data.reshape(-1, 1), verbose=0)
+            predicted_label = np.argmax(predictions)
+            return self.REVERSE_LABELS[predicted_label], predicted_label
+        except Exception as e:
+            logging.error(f"Error predicting behavior: {e}")
+            return "Unknown", None
+
+    def detect_anomaly(self, behavior_index, data):
+        try:
+            behavior_files = {
+                0: "Iso_standing.csv",
+                1: "Iso_sitting.csv",
+                2: "Iso_walking.csv",
+                3: "Iso_limping.csv",
+                4: "Iso_Heel_Av_st.csv",
+                5: "Iso_Heel_Av_dy.csv",
+                6: "Iso_Lat_pre_st.csv",
+                7: "Iso_Lat_pre_dy.csv"
+            }
+            reference_data = pd.read_csv(behavior_files[behavior_index])
+            combined_data = np.vstack([reference_data, data])
+            iso_model = IsolationForest(contamination=0.1, random_state=42)
+            try:
+                iso_model.fit(combined_data)
+                predictions = iso_model.predict(combined_data)
+                scores = iso_model.score_samples(combined_data)
+                return predictions[-1] == -1, scores[-1]
+            except Exception as e:
+                logging.error(f"Error detecting anomaly: {e}")
+                return False, 0.0
+        except Exception as e:
+            logging.error(f"Error reading reference data or fitting model: {e}")
+            return False, 0.0
+
+    def toggle_recording(self):
+        self.recording = not self.recording
+        if self.recording:
+            self.record_button.configure(text="Stop Recording")
+            self.recorded_data = []  # Clear previous recordings
+        else:
+            self.record_button.configure(text="Start Recording")
+
+    def export_data(self):
+        if not self.recorded_data:
+            messagebox.showwarning("Warning", "No data to export!")
+            return
+        try:
+            filename = f"smart_sole_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(filename, 'w') as f:
+                json.dump(self.recorded_data, f, indent=2)
+            messagebox.showinfo("Success", f"Data exported to {filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export data: {e}")
+
+    def calibrate(self):
+         # Implement calibration logic here
+        messagebox.showinfo("Calibration", "Calibration not implemented yet")
+
+
+    def update_plot(self, frame):
+        self.heel_line.set_data(range(len(self.heel_data)), self.heel_data)
+        self.lat_arch_line.set_data(range(len(self.lat_arch_data)), self.lat_arch_data)
+        self.med_meta_line.set_data(range(len(self.med_meta_data)), self.med_meta_data)
+        
+        # Adjust plot limits
+        self.ax.relim()
+        self.ax.autoscale_view()
+        
+        return self.heel_line, self.lat_arch_line, self.med_meta_line
+
+    async def run(self):
+        ble_task = asy.create_task(self.start_ble())
+        self.ani = animation.FuncAnimation(
+            self.fig, self.update_plot, interval=100, blit=True)
+        while True:
+            self.root.update()
+            await asy.sleep(0.1)
+            if not self.root.winfo_exists():
+                ble_task.cancel()
+                break
+
+def main():
+    monitor = SmartSoleMonitor()
+    asy.run(monitor.run())
+
+if __name__ == "__main__":
+    main()
