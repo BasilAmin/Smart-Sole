@@ -331,6 +331,8 @@ Potential next steps include:
 - [ ] Investigate wearable feedback methods
 - [ ] Document hardware assembly and wiring
 - [ ] Develop and evaluate a future Version 2 prototype
+- [ ] Utilize LLMs for single model,time-series based highly descriptive feedback based off FSR data
+- [ ] Increase the number of sensors
 
 ## Documentation
 
